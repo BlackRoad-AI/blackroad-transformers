@@ -16,9 +16,10 @@
 
 import unittest
 
-from transformers import is_torch_available
+from transformers import AutoTokenizer, is_torch_available
 from transformers.testing_utils import (
     Expectations,
+    cleanup,
     is_flaky,
     require_torch,
     require_torch_accelerator,
@@ -88,76 +89,41 @@ class MiniMaxM2ModelTest(CausalLMModelTest, unittest.TestCase):
         self.assertNotAlmostEqual(include_padding_result.aux_loss.item(), result.aux_loss.item())
 
 
-@unittest.skip("")
+@slow
 @require_torch
 class MiniMaxM2IntegrationTest(unittest.TestCase):
-    @slow
-    @require_torch_accelerator
-    def test_small_model_logits(self):
-        model_id = "hf-internal-testing/MiniMaxM2-tiny"
-        dummy_input = torch.LongTensor([[0, 1, 0], [0, 1, 0]]).to(torch_device)
+    def setup(self):
+        cleanup(torch_device, gc_collect=True)
 
-        model = MiniMaxM2ForCausalLM.from_pretrained(
-            model_id,
-            dtype=torch.bfloat16,
-        ).to(torch_device)
-        # TODO: might need to tweak it in case the logits do not match on our daily runners
-        # these logits have been obtained with the original megablocks implementation.
-        # ("cuda", 8) for A100/A10, and ("cuda", 7) for T4
-        # considering differences in hardware processing and potential deviations in output.
-        # fmt: off
-        EXPECTED_LOGITS = Expectations(
-            {
-                ("cuda", 7): torch.Tensor([[0.1640, 0.1621, 0.6093], [-0.8906, -0.1640, -0.6093], [0.1562, 0.1250, 0.7226]]).to(torch_device),
-                ("cuda", 8): torch.Tensor([[0.1631, 0.1621, 0.6094], [-0.8906, -0.1621, -0.6094], [0.1572, 0.1270, 0.7227]]).to(torch_device),
-                ("rocm", 9): torch.Tensor([[0.1641, 0.1621, 0.6094], [-0.8906, -0.1631, -0.6094], [0.1572, 0.1260, 0.7227]]).to(torch_device),
-            }
-        )
-        # fmt: on
-        expected_logit = EXPECTED_LOGITS.get_expectation()
+    def tearDown(self):
+        # TODO (joao): automatic compilation, i.e. compilation when `cache_implementation="static"` is used, leaves
+        # some memory allocated in the cache, which means some object is not being released properly. This causes some
+        # unoptimal memory usage, e.g. after certain tests a 7B model in FP16 no longer fits in a 24GB GPU.
+        # Investigate the root cause.
+        cleanup(torch_device, gc_collect=True)
 
-        with torch.no_grad():
-            logits = model(dummy_input).logits
-
-        logits = logits.float()
-
-        torch.testing.assert_close(logits[0, :3, :3], expected_logit, atol=1e-3, rtol=1e-3)
-        torch.testing.assert_close(logits[1, :3, :3], expected_logit, atol=1e-3, rtol=1e-3)
-
-    @slow
     @require_torch_accelerator
     def test_small_model_logits_batched(self):
-        model_id = "hf-internal-testing/MiniMaxM2-tiny"
+        model_id = "hf-internal-testing/MiniMax-M2-Small"
         dummy_input = torch.LongTensor([[0, 0, 0, 0, 0, 0, 1, 2, 3], [1, 1, 2, 3, 4, 5, 6, 7, 8]]).to(torch_device)
         attention_mask = dummy_input.ne(0).to(torch.long)
 
         model = MiniMaxM2ForCausalLM.from_pretrained(
             model_id,
-            dtype=torch.bfloat16,
-        ).to(torch_device)
-
-        # TODO: might need to tweak it in case the logits do not match on our daily runners
-        #
-        # ("cuda", 8) for A100/A10, and ("cuda", 7) for T4.
-        #
-        # considering differences in hardware processing and potential deviations in generated text.
+            dtype=torch.float16,
+            device_map="auto"
+        )
 
         EXPECTED_LOGITS_LEFT_UNPADDED = Expectations(
             {
-                ("xpu", 3): [[0.2236, 0.5195, -0.3828], [0.8203, -0.2295, 0.6055], [0.2676, -0.7070, 0.2461]],
-                ("cuda", 7): [[0.2236, 0.5195, -0.3828], [0.8203, -0.2275, 0.6054], [0.2656, -0.7070, 0.2460]],
                 ("cuda", 8): [[0.2217, 0.5195, -0.3828], [0.8203, -0.2295, 0.6055], [0.2676, -0.7109, 0.2461]],
-                ("rocm", 9): [[0.2236, 0.5195, -0.3828], [0.8203, -0.2285, 0.6055], [0.2637, -0.7109, 0.2451]],
             }
         )
         expected_left_unpadded = torch.tensor(EXPECTED_LOGITS_LEFT_UNPADDED.get_expectation(), device=torch_device)
 
         EXPECTED_LOGITS_RIGHT_UNPADDED = Expectations(
             {
-                ("xpu", 3): [[0.2178, 0.1270, -0.1641], [-0.3496, 0.2988, -1.0312], [0.0693, 0.7930, 0.8008]],
-                ("cuda", 7): [[0.2167, 0.1269, -0.1640], [-0.3496, 0.2988, -1.0312], [0.0688, 0.7929, 0.8007]],
                 ("cuda", 8): [[0.2178, 0.1260, -0.1621], [-0.3496, 0.2988, -1.0312], [0.0693, 0.7930, 0.8008]],
-                ("rocm", 9): [[0.2197, 0.1250, -0.1611], [-0.3516, 0.3008, -1.0312], [0.0684, 0.7930, 0.8008]],
             }
         )
         expected_right_unpadded = torch.tensor(EXPECTED_LOGITS_RIGHT_UNPADDED.get_expectation(), device=torch_device)
@@ -178,3 +144,22 @@ class MiniMaxM2IntegrationTest(unittest.TestCase):
             atol=1e-3,
             rtol=1e-3,
         )
+
+    def test_small_model_generation(self):
+        expected_texts = Expectations(
+            {
+                ("cuda", 8): 'Tell me about the french revolution. The french revolution was a period of radical political and social upheaval in France that lasted from 1789 until 1799. It was a time of great change and upheaval, marked by the overthrow of the monarchy, the rise of the middle class, and the eventual establishment of the First French Republic.\nThe revolution began in 1789 with the Estates-General, a representative assembly that had not met since 1614. The Third Estate, which represented the common people, demanded greater representation and eventually broke away to form the National Assembly. The National Assembly adopted the Declaration of the Rights of Man and of the Citizen, which enshr',
+            }
+        )  # fmt: skip
+        EXPECTED_TEXT = expected_texts.get_expectation()
+
+        tokenizer = AutoTokenizer.from_pretrained("MiniMaxAI/MiniMax-M2")
+        model = MiniMaxM2ForCausalLM.from_pretrained(
+            "hf-internal-testing/MiniMax-M2-Small", device_map="auto", dtype=torch.float16
+        )
+        input_text = ["Tell me about the french revolution."]
+        model_inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+
+        generated_ids = model.generate(**model_inputs, max_new_tokens=32, do_sample=False)
+        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        self.assertEqual(generated_text, EXPECTED_TEXT)
